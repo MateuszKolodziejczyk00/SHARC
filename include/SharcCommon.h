@@ -115,11 +115,19 @@
 #endif
 #include "HashGridCommon.h"
 
+#ifndef SHARC_MK_CHANGES
+#define SHARC_MK_CHANGES 0
+#endif // SHARC_MK_CHANGES
+
 struct SharcParameters
 {
     HashGridParameters gridParameters;
     HashMapData hashMapData;
     bool enableAntiFireflyFilter;
+
+#if SHARC_MK_CHANGES
+    float exposure;
+#endif // SHARC_MK_CHANGES
 
     RW_STRUCTURED_BUFFER(voxelDataBuffer, uint4);
     RW_STRUCTURED_BUFFER(voxelDataBufferPrev, uint4);
@@ -157,6 +165,10 @@ struct SharcResolveParameters
     uint accumulationFrameNum;
     uint staleFrameNumMax;
     bool enableAntiFireflyFilter;
+
+#if SHARC_MK_CHANGES
+    float exposurePrev;
+#endif // SHARC_MK_CHANGES
 };
 
 uint SharcGetSampleNum(uint packedData)
@@ -174,9 +186,17 @@ uint SharcGetAccumulatedFrameNum(uint packedData)
     return (packedData >> SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) & SHARC_ACCUMULATED_FRAME_NUM_BIT_MASK;
 }
 
+#if SHARC_MK_CHANGES
+float3 SharcResolveAccumulatedRadiance(uint3 accumulatedRadiance, uint accumulatedSampleNum, float exposure)
+#else
 float3 SharcResolveAccumulatedRadiance(uint3 accumulatedRadiance, uint accumulatedSampleNum)
+#endif // SHARC_MK_CHANGES
 {
-    return accumulatedRadiance / (accumulatedSampleNum * float(SHARC_RADIANCE_SCALE));
+#if SHARC_MK_CHANGES
+    return accumulatedRadiance / (accumulatedSampleNum * float(SHARC_RADIANCE_SCALE) * exposure);
+#else
+	return accumulatedRadiance / (accumulatedSampleNum * float(SHARC_RADIANCE_SCALE));
+#endif // SHARC_MK_CHANGES
 }
 
 SharcVoxelData SharcUnpackVoxelData(uint4 voxelDataPacked)
@@ -223,7 +243,11 @@ void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIn
             const uint sampleConfidenceThreshold = 2;
             if (sampleNumPrev > SHARC_SAMPLE_NUM_MULTIPLIER * sampleConfidenceThreshold)
             {
+#if SHARC_MK_CHANGES
+                float luminancePrev = max(dot(SharcResolveAccumulatedRadiance(voxelDataPackedPrev.xyz, sampleNumPrev, sharcParameters.exposure), float3(0.213f, 0.715f, 0.072f)), 1.0f);
+#else
                 float luminancePrev = max(dot(SharcResolveAccumulatedRadiance(voxelDataPackedPrev.xyz, sampleNumPrev), float3(0.213f, 0.715f, 0.072f)), 1.0f);
+#endif // SHARC_MK_CHANGES
                 float luminanceCur = max(dot(sampleValue * sampleWeight, float3(0.213f, 0.715f, 0.072f)), 1.0f);
                 float confidenceScale = lerp(5.0f, 10.0f, 1.0f / sampleNumPrev);
                 sampleWeight *= saturate(confidenceScale * luminancePrev / luminanceCur);
@@ -236,7 +260,11 @@ void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIn
         }
     }
 
+#if SHARC_MK_CHANGES
+    uint3 scaledRadiance = uint3(sampleValue * sampleWeight * SHARC_RADIANCE_SCALE * sharcParameters.exposure);
+#else
     uint3 scaledRadiance = uint3(sampleValue * sampleWeight * SHARC_RADIANCE_SCALE);
+#endif // SHARC_MK_CHANGES
 
     if (scaledRadiance.x != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.voxelDataBuffer, cacheIndex).x, scaledRadiance.x);
     if (scaledRadiance.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.voxelDataBuffer, cacheIndex).y, scaledRadiance.y);
@@ -277,7 +305,11 @@ bool SharcUpdateHit(in SharcParameters sharcParameters, inout SharcState sharcSt
         SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.voxelDataBufferPrev, cacheIndex);
         if (voxelData.accumulatedSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
         {
+#if SHARC_MK_CHANGES
+            sharcRadiance = SharcResolveAccumulatedRadiance(voxelData.accumulatedRadiance, voxelData.accumulatedSampleNum, sharcParameters.exposure);
+#else
             sharcRadiance = SharcResolveAccumulatedRadiance(voxelData.accumulatedRadiance, voxelData.accumulatedSampleNum);
+#endif // SHARC_MK_CHANGES
 #if !SHARC_INCLUDE_DIRECT_LIGHTING
             sharcRadiance += directLighting;
 #endif // !SHARC_INCLUDE_DIRECT_LIGHTING
@@ -337,7 +369,11 @@ bool SharcGetCachedRadiance(in SharcParameters sharcParameters, in SharcHitData 
     SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.voxelDataBuffer, cacheIndex);
     if (voxelData.accumulatedSampleNum > sampleThreshold)
     {
+#if SHARC_MK_CHANGES
+        radiance = SharcResolveAccumulatedRadiance(voxelData.accumulatedRadiance, voxelData.accumulatedSampleNum, sharcParameters.exposure);
+#else
         radiance = SharcResolveAccumulatedRadiance(voxelData.accumulatedRadiance, voxelData.accumulatedSampleNum);
+#endif // SHARC_MK_CHANGES
 
 #if SHARC_SEPARATE_EMISSIVE
         radiance += sharcHitData.emissive;
@@ -452,7 +488,13 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
     voxelDataPacked.xyz *= SHARC_SAMPLE_NUM_MULTIPLIER;
     sampleNum *= SHARC_SAMPLE_NUM_MULTIPLIER;
 
+#if SHARC_MK_CHANGES
+	const float reexposure = sharcParameters.exposure / (resolveParameters.exposurePrev > 0.f ? resolveParameters.exposurePrev : 1.f);
+    uint3 accumulatedRadiance = voxelDataPacked.xyz + voxelDataPackedPrev.xyz * reexposure;
+#else
     uint3 accumulatedRadiance = voxelDataPacked.xyz + voxelDataPackedPrev.xyz;
+#endif // SHARC_MK_CHANGES
+
     uint accumulatedSampleNum = sampleNum + sampleNumPrev;
 
 #if SHARC_BLEND_ADJACENT_LEVELS
@@ -470,7 +512,11 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
             if (adjacentSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
             {
                 float blendWeight = adjacentSampleNum / float(adjacentSampleNum + accumulatedSampleNum);
+#if SHARC_MK_CHANGES
+                accumulatedRadiance = uint3(lerp(float3(accumulatedRadiance.xyz), float3(adjacentPackedDataPrev.xyz * reexposure), blendWeight));
+#else
                 accumulatedRadiance = uint3(lerp(float3(accumulatedRadiance.xyz), float3(adjacentPackedDataPrev.xyz), blendWeight));
+#endif // SHARC_MK_CHANGES
                 accumulatedSampleNum = uint(lerp(float(accumulatedSampleNum), float(adjacentSampleNum), blendWeight));
             }
         }
